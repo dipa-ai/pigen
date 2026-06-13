@@ -130,10 +130,11 @@ Then point a DNS **A-record** `pigen.my-domain.com` → the Gateway's IP. With t
 
 The digits come from an unbounded spigot algorithm running over `math/big`. Each digit advances the generator's state, and that state grows without bound — so generation gradually slows down, which conveniently doubles as a natural rate limiter. Each TCP connection — and each browser stream — gets its own generator (it isn't concurrency-safe); the UDP reply is computed once at startup and shared, since every client wants the same leading digits anyway. The browser view (`/`) is a self-contained page served inline from the binary; it subscribes to `/stream` (Server-Sent Events) and the server paces digits out one per `PIGEN_WEB_PACE_MS`.
 
+## Credits
+
+- **pigen** — the RFC 3091 implementation — by @schors, with Claude Fable.
+- Repo, container & Kubernetes / Envoy Gateway deploy by @apten_fors, with Claude Opus.
+
 ## License
 
-A toy. Use it for whatever brings you joy.
-
----
-
-*Created by [@schors](https://github.com/schors) with Claude Fable*
+Licensed under the [Apache-2.0](LICENSE) license.
