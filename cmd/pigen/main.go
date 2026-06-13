@@ -5,6 +5,10 @@
 // number does not fit into 16 bits, the listen address is configurable
 // and defaults to :31415.
 //
+// On top of the RFC, the HTTP server serves a live browser view at / — the
+// digits stream in over Server-Sent Events from /stream — alongside the
+// probes and metrics.
+//
 // Cloud-native bits: 12-factor env config, JSON structured logging (slog),
 // /healthz + /readyz probes, expvar metrics at /debug/vars, graceful
 // shutdown on SIGTERM/SIGINT, stdlib only, static binary.
@@ -103,7 +107,8 @@ type config struct {
 	maxDigits    uint64 // per TCP connection; 0 = unlimited, per the RFC
 	udpDigits    int    // digits per UDP reply
 	writeTimeout time.Duration
-	legacyPi     bool // jurisdictions where pi is legislated to be 3
+	webPace      time.Duration // pause between digits on the web (SSE) stream
+	legacyPi     bool          // jurisdictions where pi is legislated to be 3
 }
 
 func envStr(key, def string) string {
@@ -131,6 +136,7 @@ func loadConfig() config {
 		maxDigits:    uint64(envInt("PIGEN_MAX_DIGITS", 0)),
 		udpDigits:    int(envInt("PIGEN_UDP_DIGITS", 64)),
 		writeTimeout: time.Duration(envInt("PIGEN_WRITE_TIMEOUT_SEC", 30)) * time.Second,
+		webPace:      time.Duration(envInt("PIGEN_WEB_PACE_MS", 75)) * time.Millisecond,
 		legacyPi:     os.Getenv("PIGEN_LEGACY_PI") == "true",
 	}
 }
@@ -140,11 +146,12 @@ func loadConfig() config {
 // ---------------------------------------------------------------------------
 
 var (
-	tcpConnsTotal  = expvar.NewInt("pigen_tcp_connections_total")
-	tcpConnsActive = expvar.NewInt("pigen_tcp_connections_active")
-	udpPacketsIn   = expvar.NewInt("pigen_udp_packets_total")
-	digitsSent     = expvar.NewInt("pigen_digits_sent_total")
-	ready          atomic.Bool
+	tcpConnsTotal    = expvar.NewInt("pigen_tcp_connections_total")
+	tcpConnsActive   = expvar.NewInt("pigen_tcp_connections_active")
+	udpPacketsIn     = expvar.NewInt("pigen_udp_packets_total")
+	webClientsActive = expvar.NewInt("pigen_web_clients_active")
+	digitsSent       = expvar.NewInt("pigen_digits_sent_total")
+	ready            atomic.Bool
 )
 
 // ---------------------------------------------------------------------------
@@ -279,11 +286,141 @@ func serveUDP(ctx context.Context, pc net.PacketConn, payload []byte, log *slog.
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: probes + metrics
+// Web: a live browser view of the digits over Server-Sent Events
 // ---------------------------------------------------------------------------
 
-func httpServer(cfg config) *http.Server {
+// indexHTML is the whole single-page view, inline so the binary stays the
+// only artifact. The JS avoids backticks on purpose — this is a Go raw string.
+const indexHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pigen · RFC 3091</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: #0b0e14; color: #c8e1ff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; }
+  header { padding: 1rem 1.5rem; border-bottom: 1px solid #1c2230;
+    display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 1.1rem; letter-spacing: .04em; }
+  h1 .pi { color: #ffd479; }
+  header .sub { color: #5c6b82; font-size: .8rem; }
+  .stats { margin-left: auto; color: #5c6b82; font-size: .8rem; }
+  .stats b { color: #7ee787; font-variant-numeric: tabular-nums; }
+  main { flex: 1; padding: 1.5rem; overflow-y: auto; font-size: 1.6rem;
+    line-height: 1.7; word-break: break-all; letter-spacing: .06em; color: #e6edf3; }
+  #cursor { display: inline-block; width: .55ch; height: 1.2em;
+    vertical-align: text-bottom; background: #7ee787;
+    animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .off #cursor { background: #f85149; animation: none; }
+  footer { padding: .75rem 1.5rem; border-top: 1px solid #1c2230;
+    color: #4a5a70; font-size: .75rem; }
+  a { color: #6cb6ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="pi">π</span>gen</h1>
+  <span class="sub">RFC 3091 — Pi Digit Generation Protocol</span>
+  <span class="stats">digits: <b id="count">0</b></span>
+</header>
+<main><span id="pi"></span><span id="cursor"></span></main>
+<footer>live stream over <code>/stream</code> (SSE) · raw protocol on tcp/31415 · <a href="/debug/vars">metrics</a></footer>
+<script>
+  var pi = document.getElementById("pi");
+  var count = document.getElementById("count");
+  var buf = "";
+  var digits = 0;
+  var es = new EventSource("/stream");
+  es.onmessage = function (e) {
+    buf += e.data;
+    for (var i = 0; i < e.data.length; i++) {
+      var c = e.data.charCodeAt(i);
+      if (c >= 48 && c <= 57) digits++;
+    }
+    if (buf.length > 6000) buf = buf.slice(buf.length - 6000);
+    pi.textContent = buf;
+    count.textContent = digits.toLocaleString();
+  };
+  es.onerror = function () { document.body.classList.add("off"); };
+</script>
+</body>
+</html>
+`
+
+func handleStream(ctx context.Context, w http.ResponseWriter, r *http.Request, cfg config, log *slog.Logger) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+
+	webClientsActive.Add(1)
+	defer webClientsActive.Add(-1)
+	log.Info("web stream", "remote", r.RemoteAddr)
+
+	if cfg.legacyPi {
+		// Where pi is legislated to be 3, the live stream is brief.
+		w.Write([]byte("data: 3\n\n"))
+		flusher.Flush()
+		return
+	}
+
+	s := newSpigot()
+	// First frame carries the integer part and the decimal point: "3."
+	first := []byte("data: 3.\n\n")
+	first[6] = s.next()
+	if _, err := w.Write(first); err != nil {
+		return
+	}
+	flusher.Flush()
+	digitsSent.Add(1)
+
+	tick := time.NewTicker(cfg.webPace)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done(): // server shutting down
+			return
+		case <-r.Context().Done(): // client went away
+			return
+		case <-tick.C:
+			frame := []byte("data: x\n\n")
+			frame[6] = s.next()
+			if _, err := w.Write(frame); err != nil {
+				return
+			}
+			flusher.Flush()
+			digitsSent.Add(1)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP: live view + probes + metrics
+// ---------------------------------------------------------------------------
+
+func httpServer(ctx context.Context, cfg config, log *slog.Logger) *http.Server {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(indexHTML))
+	})
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		handleStream(ctx, w, r, cfg, log)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok\n"))
@@ -327,7 +464,7 @@ func main() {
 	go serveTCP(ctx, tcpLn, cfg, log, &wg)
 	go serveUDP(ctx, udpConn, udpPayload(cfg), log, &wg)
 
-	srv := httpServer(cfg)
+	srv := httpServer(ctx, cfg, log)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "err", err)

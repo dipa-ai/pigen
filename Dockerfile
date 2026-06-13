@@ -1,7 +1,8 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod main.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /pigen .
+COPY go.mod ./
+COPY cmd ./cmd
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /pigen ./cmd/pigen
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /pigen /pigen

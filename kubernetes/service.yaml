@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pigen
+  labels: {app: pigen}
+spec:
+  selector: {app: pigen}
+  ports:
+    - {name: pi-tcp, port: 31415, targetPort: pi-tcp, protocol: TCP}
+    - {name: pi-udp, port: 31415, targetPort: pi-udp, protocol: UDP}
+    # http is what the HTTPRoute (and the probes) target — keep it here.
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}

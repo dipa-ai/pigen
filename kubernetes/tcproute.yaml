@@ -1,0 +1,15 @@
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: pigen-pi
+spec:
+  parentRefs:
+    # Generic default. The deploy overrides name/sectionName from the GitOps
+    # Application's kustomize.patches — see README. TCP is L4 (no hostname):
+    # expose it on a dedicated TCP listener and point a DNS A-record at the
+    # Gateway IP, then `nc` that name.
+    - name: gateway
+      sectionName: tcp
+  rules:
+    - backendRefs:
+        - {name: pigen, port: 31415}
