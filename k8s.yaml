@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pigen
+  labels: {app: pigen}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: pigen}
+  template:
+    metadata:
+      labels: {app: pigen}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: pigen
+          image: pigen:latest # replace with your registry
+          ports:
+            - {name: pi-tcp, containerPort: 31415, protocol: TCP}
+            - {name: pi-udp, containerPort: 31415, protocol: UDP}
+            - {name: http, containerPort: 8080, protocol: TCP}
+          env:
+            # Cap digits per connection in shared clusters; 0 = unlimited per RFC 3091
+            - {name: PIGEN_MAX_DIGITS, value: "1000000"}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      terminationGracePeriodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pigen
+spec:
+  selector: {app: pigen}
+  ports:
+    - {name: pi-tcp, port: 31415, targetPort: pi-tcp, protocol: TCP}
+    - {name: pi-udp, port: 31415, targetPort: pi-udp, protocol: UDP}
